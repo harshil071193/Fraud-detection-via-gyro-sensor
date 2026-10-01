@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Sensor Log Tracker · Fraud vs Normal Inspection</title>
+    <style>
+      /*__STYLES__*/
+    </style>
+  </head>
+  <body>
+    <div id="dropOverlay" class="drop-overlay"><div>Drop one or two sensor_log JSON files</div></div>
+    <div id="toast" class="toast"></div>
+
+    <header class="hero">
+      <div class="hero-text">
+        <div class="eyebrow">ScansAI · Fraud detection via gyro sensor</div>
+        <h1>Sensor Log Tracker</h1>
+        <p>
+          Side-by-side comparison of two smart recording sensor logs: inspection timing, missing data, whether the
+          photographer really walked around the car, how accurate our sensor implementation is, and a fraud risk score.
+        </p>
+      </div>
+      <div class="loader">
+        <div class="slot" id="slotA" data-slot="a">
+          <div class="slot-tag">A</div>
+          <div class="slot-body">
+            <input class="slot-name" id="nameA" aria-label="Name for log A" />
+            <div class="slot-file" id="fileA"></div>
+          </div>
+          <label class="btn btn-ghost">Choose<input type="file" accept=".json,application/json" id="inputA" hidden /></label>
+        </div>
+        <div class="slot" id="slotB" data-slot="b">
+          <div class="slot-tag">B</div>
+          <div class="slot-body">
+            <input class="slot-name" id="nameB" aria-label="Name for log B" />
+            <div class="slot-file" id="fileB"></div>
+          </div>
+          <label class="btn btn-ghost">Choose<input type="file" accept=".json,application/json" id="inputB" hidden /></label>
+        </div>
+        <div class="loader-actions">
+          <button class="btn" id="swapBtn" type="button">Swap A / B</button>
+          <button class="btn" id="resetBtn" type="button">Reset to included logs</button>
+          <span class="hint">Drag one file onto a slot, or two files anywhere on the page.</span>
+        </div>
+      </div>
+    </header>
+
+    <nav class="toc">
+      <a href="#verdict">Verdict</a>
+      <a href="#timing">Timing</a>
+      <a href="#completeness">Missing data</a>
+      <a href="#circle">Circle around car</a>
+      <a href="#motion">Motion</a>
+      <a href="#captures">Per photo</a>
+      <a href="#accuracy">Implementation accuracy</a>
+      <a href="#signals">Fraud signals</a>
+      <a href="#recommendations">Recommendations</a>
+    </nav>
+
+    <main>
+      <section id="verdict">
+        <div class="verdict-grid" id="verdictCards"></div>
+        <div id="warnings"></div>
+        <div class="card insights">
+          <h3>Key findings</h3>
+          <ul id="insights"></ul>
+        </div>
+      </section>
+
+      <section id="timing">
+        <h2>Inspection timing</h2>
+        <p class="lead">
+          How long each recording took, how long before the first photo, and the time between consecutive photos.
+        </p>
+        <div class="card"><div id="phaseBars"></div></div>
+        <div class="grid-2">
+          <div class="card">
+            <h3>Time between photos</h3>
+            <div class="chart-box"><canvas id="chartIntervals"></canvas></div>
+          </div>
+          <div class="card">
+            <h3>Timing differences</h3>
+            <div id="timingTable"></div>
+          </div>
+        </div>
+      </section>
+
+      <section id="completeness">
+        <h2>Data completeness and gaps</h2>
+        <p class="lead">
+          Each lane is one sensor. Red bands are periods with no samples longer than the threshold. Vertical lines
+          are photos.
+        </p>
+        <div class="card controls">
+          <label for="gapSlider">Gap threshold <strong id="gapValue">0.5 s</strong></label>
+          <input type="range" id="gapSlider" min="0.2" max="3" step="0.1" value="0.5" />
+          <span class="hint">Location always uses at least 2.5 s because GPS reports once per second.</span>
+        </div>
+        <div class="card"><div id="timelineA" class="timeline"></div></div>
+        <div class="card"><div id="timelineB" class="timeline"></div></div>
+        <div class="card">
+          <h3>Per-sensor rate and coverage</h3>
+          <div id="streamTable" class="table-wrap"></div>
+          <div id="gapLists" class="gap-lists"></div>
+        </div>
+      </section>
+
+      <section id="circle">
+        <h2>Circle around the car</h2>
+        <p class="lead">
+          A genuine inspection walks once around one car: the photo positions go round a car-sized ring, the camera
+          keeps turning the same way, and the camera points at the middle of the ring. GPS is only accurate to about
+          ±2.5–3 m, so the camera heading (from the native orientation quaternion) is the stronger signal.
+        </p>
+        <div class="grid-2" id="maps"></div>
+        <div class="grid-2" id="polars"></div>
+        <div class="card">
+          <h3>How far the camera turned at each photo</h3>
+          <p class="hint">
+            Cumulative turn in the walking direction, compared with the ideal slot of each photo around the car. A
+            genuine walk-around follows the dotted ideal line.
+          </p>
+          <div class="chart-box tall"><canvas id="chartProgress"></canvas></div>
+        </div>
+      </section>
+
+      <section id="motion">
+        <h2>Motion signatures</h2>
+        <p class="lead">
+          Time is aligned to the first photo (0 s) so both inspections line up. Triangles mark photos. Breaks in the
+          lines are data gaps.
+        </p>
+        <div class="grid-2">
+          <div class="card">
+            <h3>Gyroscope magnitude (rad/s, smoothed)</h3>
+            <div class="chart-box"><canvas id="chartGyro"></canvas></div>
+          </div>
+          <div class="card">
+            <h3>Handling acceleration (m/s², unit-corrected)</h3>
+            <div class="chart-box"><canvas id="chartAcc"></canvas></div>
+          </div>
+          <div class="card">
+            <h3>Pitch and roll (degrees)</h3>
+            <div class="chart-box"><canvas id="chartPitch"></canvas></div>
+          </div>
+          <div class="card">
+            <h3>Movement between photos</h3>
+            <div class="chart-box"><canvas id="chartSteps"></canvas></div>
+          </div>
+          <div class="card">
+            <h3 id="headingTitleA">Camera heading vs compass · A</h3>
+            <div class="chart-box"><canvas id="chartHeadingA"></canvas></div>
+          </div>
+          <div class="card">
+            <h3 id="headingTitleB">Camera heading vs compass · B</h3>
+            <div class="chart-box"><canvas id="chartHeadingB"></canvas></div>
+          </div>
+        </div>
+      </section>
+
+      <section id="captures">
+        <h2>Per-photo details</h2>
+        <div class="card"><div id="capturesA" class="table-wrap"></div></div>
+        <div class="card"><div id="capturesB" class="table-wrap"></div></div>
+      </section>
+
+      <section id="accuracy">
+        <h2>Implementation accuracy</h2>
+        <p class="lead">
+          Checks of the sensor recording itself, independent of fraud. These show what our smart recording
+          implementation gets right and what needs fixing.
+        </p>
+        <div class="card"><div id="accuracyTable" class="table-wrap"></div></div>
+      </section>
+
+      <section id="signals">
+        <h2>Fraud signals and score</h2>
+        <p class="lead">
+          Each signal scores 0–1 and is multiplied by its weight; the total is out of 100. Scores of 55+ are flagged
+          as likely fraud, 30–54 need review.
+        </p>
+        <div class="card"><div id="signalsTable" class="table-wrap"></div></div>
+        <p class="note">
+          These are heuristics. The thresholds were set from only two recordings on one device (Galaxy A26, Android),
+          so treat the score as a guide and tune it with more labelled inspections before using it to block anyone.
+        </p>
+      </section>
+
+      <section id="recommendations">
+        <h2>Recommendations</h2>
+        <div class="card"><ol id="recommendationList" class="recs"></ol></div>
+      </section>
+    </main>
+
+    <footer>Generated by logs_tracker · analysis runs entirely in this page, nothing is uploaded.</footer>
+
+    <script type="application/json" id="log-a" data-name="__NAME_A__" data-file="__FILE_A__">__LOG_A__</script>
+    <script type="application/json" id="log-b" data-name="__NAME_B__" data-file="__FILE_B__">__LOG_B__</script>
+    <script>
+      /*__CHARTJS__*/
+    </script>
+    <script>
+      /*__ENGINE__*/
+    </script>
+    <script>
+      /*__APP__*/
+    </script>
+  </body>
+</html>
