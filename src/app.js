@@ -52,6 +52,12 @@
     const name = p.platform === 'ios' ? 'iOS' : p.platform === 'android' ? 'Android' : 'unknown platform';
     return p.source === 'metadata' ? name : `${name} (${p.platform === 'unknown' ? 'not in metadata' : 'detected'})`;
   };
+  const appFlagLabel = (w) => (!w ? 'not logged' : w.status === 'insufficient_data' ? 'insufficient data' : w.status);
+  const appFlagLevel = (w) => (!w ? '' : w.status === 'normal' ? 'ok' : w.status === 'suspicious' ? 'bad' : 'warn');
+  const which = (pred) => {
+    const hit = SLOTS.filter((s) => pred(state.res[s]));
+    return hit.length === 2 ? 'A and B' : hit.length ? hit[0].toUpperCase() : '';
+  };
   const alpha = (hex, a) => {
     const n = parseInt(hex.slice(1), 16);
     return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${a})`;
@@ -356,8 +362,8 @@
     </svg>`;
   }
 
-  function kpi(label, value, lvl) {
-    return `<div class="kpi"><div class="k">${esc(label)}</div><div class="v ${lvl || ''}">${value}</div></div>`;
+  function kpi(label, value, lvl, wide) {
+    return `<div class="kpi${wide ? ' wide' : ''}"><div class="k">${esc(label)}</div><div class="v ${lvl || ''}">${value}</div></div>`;
   }
 
   function renderVerdict(a, b) {
@@ -381,7 +387,7 @@
       return `<div class="card verdict" style="--accent:${color(slot)}">
         <div class="verdict-head"><div class="tag">${slot.toUpperCase()}</div>
           <div><div class="vname">${esc(state.names[slot])}</div>
-          <div class="vfile">${esc(state.files[slot])} · ${esc(m['device name'] || '?')} · app ${esc(m.appVersion || '?')} · orientation ${esc(m.orientationSource || '?')}${res.timing.startedAt ? ` · ${esc(res.timing.startedAt.toLocaleString())}` : ''}</div></div>
+          <div class="vfile">${esc(state.files[slot])} · ${esc(m['device name'] || '?')} · app ${esc(m.appVersion || '?')} · orientation ${esc(m.orientationSource || '?')} · motion sensors ${esc(res.app.motionSource || 'not logged')}${res.app.headingReference ? ` · heading ${esc(res.app.headingReference)}` : ''}${res.timing.startedAt ? ` · ${esc(res.timing.startedAt.toLocaleString())}` : ''}</div></div>
           <span class="platform-tag ${res.platform.platform}">${esc(platformLabel(res))}</span>
         </div>
         <div class="verdict-body">${gauge(f.score, f.level)}
@@ -398,6 +404,12 @@
           ${kpi('Camera → car centre', ring ? `${ring.facingMeanAbs.toFixed(0)}°` : '–', ring ? facingLevel(ring.facingMeanAbs) : '')}
           ${kpi('Ring size', ring ? `${ring.length.toFixed(1)}×${ring.width.toFixed(1)} m` : '–')}
           ${kpi('Gyro mean', `${fmt(res.motion.gyroMean, 2)} rad/s`, res.motion.gyroMean > 0.6 ? 'bad' : res.motion.gyroMean > 0.45 ? 'warn' : 'ok')}
+          ${kpi(
+            'App walk-around flag (written by the app)',
+            `${esc(appFlagLabel(res.app.walkaround))}${res.app.walkaround ? `<span class="small"> · ${esc(res.checks.walkaroundFlag.value)}</span>` : '<span class="small"> · boltSA or older revamp build</span>'}`,
+            appFlagLevel(res.app.walkaround),
+            true,
+          )}
         </div>
       </div>`;
     };
@@ -463,13 +475,27 @@
     }
     const oa = a.stats.Orientation;
     const ob = b.stats.Orientation;
-    if (oa && ob) {
+    if (oa && ob && (oa.gaps.length || ob.gaps.length)) {
+      const period = [a.gapPeriod, b.gapPeriod].filter(finite);
       items.push(
-        `Data gaps over ${state.gapThreshold.toFixed(1)} s: ${oa.gaps.length} (${nA}) and ${ob.gaps.length} (${nB}), longest ${oa.longest.toFixed(1)} s / ${ob.longest.toFixed(1)} s, recurring about every ${fmt(a.gapPeriod, 0)}–${fmt(b.gapPeriod, 0)} s across all sensors at once. Native orientation runs at ${oa.rate.toFixed(1)} Hz of the ${oa.targetHz.toFixed(0)} Hz target.`,
+        `Data gaps over ${state.gapThreshold.toFixed(1)} s: ${oa.gaps.length} (${nA}) and ${ob.gaps.length} (${nB}), longest ${oa.longest.toFixed(1)} s / ${ob.longest.toFixed(1)} s${period.length ? `, recurring about every ${period.map((p) => p.toFixed(0)).join('–')} s across all sensors at once` : ''}. Native orientation runs at ${oa.rate.toFixed(1)} Hz of the ${oa.targetHz.toFixed(0)} Hz target.`,
+      );
+    } else if (oa && ob) {
+      items.push(
+        `<span class="txt-ok">No data gaps</span> over ${state.gapThreshold.toFixed(1)} s in either log. Native orientation runs at ${oa.rate.toFixed(1)} / ${ob.rate.toFixed(1)} Hz of the ${oa.targetHz.toFixed(0)} Hz target.`,
+      );
+    }
+    const awA = a.app.walkaround;
+    const awB = b.app.walkaround;
+    if (awA || awB) {
+      const flag = (res, n) => `${n} <strong>${esc(appFlagLabel(res.app.walkaround))}</strong>`;
+      const disagree = which((r) => r.checks.walkaroundFlag.status === 'fail');
+      items.push(
+        `The app's own walk-around flag: ${flag(a, nA)}, ${flag(b, nB)}.${disagree ? ` <span class="txt-bad">It disagrees with this page's re-run of the same rule for ${disagree}</span>; see Implementation accuracy.` : ''}`,
       );
     }
     items.push(
-      `The compass (<code>magneticBearing</code>) disagrees with the camera heading by ${fmt(a.compassAgreement.atCaptures, 0)}° / ${fmt(b.compassAgreement.atCaptures, 0)}° at photos, because it is not tilt-compensated. This page uses the quaternion heading instead.`,
+      `The compass (<code>magneticBearing</code>) disagrees with the camera heading by ${fmt(a.compassAgreement.atCaptures, 0)}° / ${fmt(b.compassAgreement.atCaptures, 0)}° at photos, because it is not tilt-compensated. ${a.loggedHeading.n || b.loggedHeading.n ? 'Walk-around checks use the logged <code>cameraHeading</code> instead.' : 'This page uses the quaternion heading instead.'}`,
     );
     $('insights').innerHTML = items.map((i) => `<li>${i}</li>`).join('');
   }
@@ -582,6 +608,13 @@
     return `<div class="timeline-title"><h3><span class="col-${slot}">${slot.toUpperCase()}</span> · ${esc(state.names[slot])}</h3><span class="hint">${res.captures.length} photos · ${fmtDur(res.timing.duration)} · gaps repeat every ~${fmt(res.gapPeriod, 1)} s</span></div><svg viewBox="0 0 ${W} ${H2}">${s}</svg>`;
   }
 
+  function sensorSource(name, a, b) {
+    if (name === 'Location') return 'GPS';
+    if (E.NATIVE_SENSORS.includes(name)) return 'native module';
+    const src = (res) => (res.app.motionSource === 'native' ? 'native module' : 'react-native-sensors');
+    return src(a) === src(b) ? src(a) : `A ${src(a)}, B ${src(b)}`;
+  }
+
   function renderCompleteness(a, b) {
     $('gapSlider').value = state.gapThreshold;
     $('gapValue').textContent = `${state.gapThreshold.toFixed(1)} s`;
@@ -603,7 +636,7 @@
     $('streamTable').innerHTML = `<table><thead>
       <tr><th></th><th colspan="5" class="col-a">A · ${esc(state.names.a)}</th><th colspan="5" class="col-b">B · ${esc(state.names.b)}</th></tr>
       <tr><th>Sensor</th>${'<th class="num">Rate</th><th class="num">Samples</th><th class="num">Gaps</th><th class="num">Coverage</th><th class="num">Bursts &lt;5ms</th>'.repeat(2)}</tr></thead>
-      <tbody>${names.map((n) => `<tr><td><strong>${n}</strong><div class="small">${E.NATIVE_SENSORS.includes(n) ? 'native module' : n === 'Location' ? 'GPS' : 'react-native-sensors'}</div></td>${cells(a.stats[n])}${cells(b.stats[n])}</tr>`).join('')}</tbody></table>`;
+      <tbody>${names.map((n) => `<tr><td><strong>${n}</strong><div class="small">${sensorSource(n, a, b)}</div></td>${cells(a.stats[n])}${cells(b.stats[n])}</tr>`).join('')}</tbody></table>`;
 
     const chips = (res, slot) => {
       const st = res.stats.Orientation;
@@ -911,7 +944,7 @@
             <td class="num">${finite(c.interval) ? `${c.interval.toFixed(1)} s` : '–'}</td>
             <td class="num">${finite(c.gpsStep) ? `${c.gpsStep.toFixed(1)} m` : '–'}</td>
             <td class="num">${fmt(c.ringAngle, 0, '°')}</td>
-            <td class="num">${fmt(c.cam, 0, '°')}</td>
+            <td class="num">${fmt(c.cam, 0, '°')}${finite(c.appCam) ? `<div class="small">app ${fmt(c.appCam, 0, '°')}</div>` : ''}</td>
             <td class="num">${fmt(c.camProgress, 0, '°')}<div class="small">ideal ${fmt(expected, 0, '°')}</div></td>
             <td class="num ${Math.abs(slotErr) > 60 ? 'txt-bad' : Math.abs(slotErr) > 30 ? 'txt-warn' : 'txt-ok'}">${fmtSigned(slotErr, 0, '°')}</td>
             <td class="num ${levelClass(fl)}">${fmtSigned(c.facing, 0, '°')}</td>
@@ -933,14 +966,18 @@
 
   // ---------- accuracy ----------
   function renderAccuracy(a, b) {
-    const gp = `${fmt(a.gapPeriod, 0)}–${fmt(b.gapPeriod, 0)} s`;
+    const period = [a.gapPeriod, b.gapPeriod].filter(finite);
+    const gp = period.length ? `${period.map((p) => p.toFixed(0)).join('–')} s` : 'few seconds';
+    const hasLoggedHeading = a.loggedHeading.n || b.loggedHeading.n;
+    // `why`/`fix` describe a problem; `ok` replaces them when every log passes, `na` replaces `fix` when neither log has the data.
     const defs = [
       {
         id: 'accTotal',
         title: 'Total acceleration magnitude',
         expected: '≈ 9.81 m/s² (1 g) when handheld',
-        why: 'On Android, react-native-sensors already reports m/s², but both apps multiply by G (9.80665) again: boltSA <code>SensorRecorderService.ts</code> lines 292–294 and revamp <code>smartRecordingSensors.ts</code>. Values are about 9.8× too large on Android.',
-        fix: 'Multiply by G only on iOS (<code>Platform.OS === \'ios\'</code>), where the library reports g.',
+        why: 'On Android, react-native-sensors already reports m/s², but older builds multiply by G (9.80665) again: boltSA <code>SensorRecorderService.ts</code> and revamp builds before the sensor accuracy fix. Values are about 9.8× too large on Android.',
+        fix: 'Multiply by G only on iOS (<code>Platform.OS === \'ios\'</code>), where the library reports g. Done in revamp builds that log <code>motionSensorSource</code>.',
+        ok: 'Reported in m/s² on both platforms.',
       },
       {
         id: 'accLinear',
@@ -948,13 +985,14 @@
         expected: '< 2.5 m/s² median',
         why: 'Calculated as TotalAcceleration − Gravity, so it inherits the 9.8× error.',
         fix: 'Fixed automatically once TotalAcceleration is corrected.',
+        ok: 'TotalAcceleration − Gravity, small while the phone is handheld.',
       },
       { id: 'gravity', title: 'Gravity magnitude', expected: '≈ 9.81 m/s²', why: 'Comes from the native module (Android TYPE_GRAVITY / iOS CoreMotion).', fix: 'None needed.' },
       {
         id: 'sumCheck',
         title: 'Gravity + Accelerometer = TotalAcceleration',
         expected: '< 0.5 m/s² residual',
-        why: 'Confirms the three rows are written from the same samples. Consistent, even though the scale is wrong.',
+        why: 'Confirms the three rows are written from the same samples, whatever their scale.',
         fix: 'None needed.',
       },
       { id: 'qnorm', title: 'Orientation quaternion is unit length', expected: '| |q| − 1 | < 0.01', why: 'A valid rotation; the camera heading on this page is derived from it.', fix: 'None needed.' },
@@ -963,22 +1001,25 @@
         id: 'rateNative',
         title: 'Native orientation sample rate',
         expected: '≥ 90% of target',
-        why: 'The native module throttles to the target rate, but samples reach the log through the JS bridge, and some are lost while JS is busy.',
-        fix: 'Buffer samples in native code with sensor timestamps and send them in batches.',
+        why: 'Older builds throttle in native code, but samples reach the log through the JS bridge one by one, and some are lost while JS is busy.',
+        fix: 'Buffer samples in native code with sensor timestamps and send them in batches. Done in revamp builds that log <code>motionSensorSource</code>.',
+        ok: 'Native module keeps up with the target rate.',
       },
       {
         id: 'rateRN',
-        title: 'react-native-sensors sample rate',
+        title: 'Motion sensor sample rate (accelerometer, gyroscope, magnetometer)',
         expected: '≥ 90% of target',
-        why: 'The 50 ms update interval is only a hint; the effective rate on this device is about 12–14 Hz.',
-        fix: 'Move gyroscope and accelerometer into the native module too, or request a faster sensor delay.',
+        why: 'With react-native-sensors the 50 ms update interval is only a hint; older builds reach about 12–14 Hz. The value shows which source each log used.',
+        fix: 'Read these sensors in the native module with a 20 Hz schedule (revamp, <code>motionSensorSource: native</code>).',
+        ok: 'Motion sensors keep up with the target rate.',
       },
       {
         id: 'gaps',
         title: 'Data gaps over the threshold',
         expected: '0',
         why: `Gaps line up across every sensor, including native ones, and repeat about every ${gp}. That points to the JS thread being blocked (camera capture, image processing), not the sensors stopping.`,
-        fix: 'Timestamp and buffer in native code; move heavy capture work off the JS thread.',
+        fix: 'Timestamp and buffer in native code on a background thread; move heavy capture work off the JS thread.',
+        ok: 'No sensor stops for longer than the threshold.',
       },
       {
         id: 'bursts',
@@ -986,15 +1027,43 @@
         expected: '< 2%',
         why: 'After a stall, queued samples arrive together and all get nearly the same <code>Date.now()</code> timestamp.',
         fix: 'Use the sensor event timestamp instead of the time JS receives the event.',
+        ok: 'Samples carry the time the sensor took them.',
       },
-      { id: 'monotonic', title: 'Timestamps in order', expected: 'no out-of-order, < 1% duplicates', why: 'Duplicates come from the same burst effect.', fix: 'Same fix as bursty delivery.' },
-      { id: 'timeConsistency', title: '<code>time</code> vs <code>seconds_elapsed</code>', expected: 'constant offset, spread < 20 ms', why: 'Both come from <code>Date.now()</code>; a constant offset is harmless.', fix: 'None needed.' },
+      {
+        id: 'monotonic',
+        title: 'Timestamps in order',
+        expected: 'no out-of-order, < 1% duplicates',
+        why: 'Duplicates come from the same burst effect.',
+        fix: 'Same fix as bursty delivery.',
+        ok: 'Timestamps increase steadily.',
+      },
+      { id: 'timeConsistency', title: '<code>time</code> vs <code>seconds_elapsed</code>', expected: 'constant offset, spread < 20 ms', why: 'Both are written from the same timestamp; a constant offset is harmless.', fix: 'None needed.' },
       {
         id: 'compass',
         title: 'Compass agrees with camera heading at photos',
         expected: '< 20° mean difference',
         why: '<code>magneticBearing</code> is calculated from the raw magnetometer x/y without tilt compensation. When the phone is held upright for a photo it no longer matches where the camera points.',
-        fix: 'Use the heading from the orientation quaternion (as this page does) or tilt-compensate with gravity.',
+        fix: hasLoggedHeading
+          ? 'None needed: the app logs <code>cameraHeading</code> from the quaternion and its walk-around check uses that. The compass is kept for reference only.'
+          : 'Use the heading from the orientation quaternion (as this page does) or tilt-compensate with gravity.',
+      },
+      {
+        id: 'cameraHeadingLogged',
+        title: 'Logged <code>cameraHeading</code> matches the quaternion',
+        expected: '95% within 1°',
+        why: 'The app writes the rear-camera heading on every Orientation row. It should equal what this page calculates from <code>qx, qy, qz, qw</code> for the same platform.',
+        fix: 'Check the platform frame (Android east-north-up, iOS north-west-up) in <code>smartRecordingWalkaround.ts</code>.',
+        ok: 'The app and this page calculate the same camera heading.',
+        na: 'Not logged by these builds (boltSA, or revamp before the sensor accuracy fix).',
+      },
+      {
+        id: 'walkaroundFlag',
+        title: 'App walk-around flag matches this page',
+        expected: 'same status, reversals and sweep',
+        why: `The app flags an inspection as suspicious with ${E.APP_RULE.suspiciousReversals}+ heading reversals, or under ${E.APP_RULE.minSweepDeg}° sweep with ${E.APP_RULE.sweepCheckMinPhotos}+ photos, using the latest photo of each position in position order. This page re-runs that rule on its own headings. It is a simpler check than the fraud score below.`,
+        fix: 'Compare the per-photo headings (Per-photo details, "app" values) and the photo labels with <code>smartRecordingWalkaround.ts</code>.',
+        ok: `The app's flag matches this page's re-run of the same rule.`,
+        na: 'Not logged by these builds (boltSA, or revamp before the sensor accuracy fix).',
       },
       { id: 'latency', title: 'Snapshot timing at photo', expected: '0–500 ms before <code>captured_at</code>', why: 'Each photo stores the latest sample of every sensor.', fix: 'None needed.' },
       {
@@ -1017,7 +1086,15 @@
     };
     $('accuracyTable').innerHTML = `<div class="small" style="margin-bottom:8px"><span class="col-a">A</span>: ${count(a)} &nbsp;&nbsp; <span class="col-b">B</span>: ${count(b)}</div>
       <table><thead><tr><th>Check</th><th>Expected</th><th class="col-a">A · ${esc(state.names.a)}</th><th class="col-b">B · ${esc(state.names.b)}</th><th>Why / likely cause</th><th>Fix</th></tr></thead>
-      <tbody>${defs.map((d) => `<tr><td class="check-title">${d.title}</td><td class="small">${d.expected}</td>${cell(a.checks[d.id])}${cell(b.checks[d.id])}<td class="small">${d.why}</td><td class="small">${d.fix}</td></tr>`).join('')}</tbody></table>`;
+      <tbody>${defs
+        .map((d) => {
+          const st = [a, b].map((r) => (r.checks[d.id] ? r.checks[d.id].status : 'na'));
+          const allNa = st.every((s) => s === 'na');
+          const fine = d.ok && !allNa && st.every((s) => s === 'pass' || s === 'na');
+          const fix = allNa && d.na ? d.na : fine ? 'None needed.' : d.fix;
+          return `<tr><td class="check-title">${d.title}</td><td class="small">${d.expected}</td>${cell(a.checks[d.id])}${cell(b.checks[d.id])}<td class="small">${fine ? d.ok : d.why}</td><td class="small">${fix}</td></tr>`;
+        })
+        .join('')}</tbody></table>`;
   }
 
   // ---------- fraud signals ----------
@@ -1042,16 +1119,80 @@
 
   // ---------- recommendations ----------
   function renderRecommendations(a, b) {
-    const oa = a.stats.Orientation;
-    const recs = [
-      `<strong>Fix the Android acceleration unit bug.</strong> TotalAcceleration is ${fmt(a.checks.accTotal.raw, 0)} m/s² instead of 9.81 because react-native-sensors already returns m/s² on Android and we multiply by G again. Apply the G factor on iOS only. Affects boltSA <code>SensorRecorderService.ts</code> and revamp <code>smartRecordingSensors.ts</code>; linear acceleration is fixed by the same change.`,
-      `<strong>Use sensor timestamps, not <code>Date.now()</code>.</strong> ${(a.checks.bursts.raw * 100).toFixed(0)}–${(b.checks.bursts.raw * 100).toFixed(0)}% of gyro samples arrive less than 5 ms apart, which is the JS bridge flushing a backlog. Pass <code>event.timestamp</code> from the native side so the timeline is real even when JS stalls.`,
-      `<strong>Remove the recurring gaps.</strong> All sensors stop together for 0.5–4 s about every ${fmt(a.gapPeriod, 0)} s, around photo capture. Buffer samples in the native module and flush them in batches, and keep image processing off the JS thread during recording.`,
-      `<strong>Raise the effective sample rate.</strong> Native orientation reaches ${oa ? oa.rate.toFixed(1) : '?'} Hz and react-native-sensors about 12–14 Hz against a ${oa ? oa.targetHz.toFixed(0) : 20} Hz target. Moving gyroscope and accelerometer into the native module (as done for orientation) would fix both.`,
-      `<strong>Use the quaternion camera heading for fraud checks.</strong> The logged compass is not tilt-compensated and disagrees with the camera by ${fmt(a.compassAgreement.atCaptures, 0)}–${fmt(b.compassAgreement.atCaptures, 0)}° at photos. Either log a tilt-compensated heading or compute the camera heading from <code>qx, qy, qz, qw</code> as this page does.`,
-      `<strong>Add a walk-around check to the app or backend.</strong> The two strongest signals are cheap to compute from the existing annotations: camera heading reversals between photos (A ${a.camProgress ? a.camProgress.reversals : '?'}, B ${b.camProgress ? b.camProgress.reversals : '?'}) and total camera sweep (A ${a.camProgress ? a.camProgress.net.toFixed(0) : '?'}°, B ${b.camProgress ? b.camProgress.net.toFixed(0) : '?'}°). They could warn the user live or flag the inspection for review.`,
-      `<strong>Collect more labelled runs before trusting the score.</strong> Record several genuine and fraudulent inspections on different devices, including iOS, then tune the weights and thresholds in <code>src/engine.js</code>.`,
-    ];
+    const bad = (id) => (r) => r.checks[id] && (r.checks[id].status === 'warn' || r.checks[id].status === 'fail');
+    const both = (fn, d = 0, unit = '') => SLOTS.map((s) => `${s.toUpperCase()} ${fmt(fn(state.res[s]), d, unit)}`).join(', ');
+    // Tells apart "old build, already fixed in revamp" from "fixed build, but the fix is not working here".
+    const buildNote = (pred) => {
+      const nativeHit = SLOTS.filter((s) => pred(state.res[s]) && state.res[s].app.motionSource === 'native');
+      const oldHit = SLOTS.filter((s) => pred(state.res[s]) && state.res[s].app.motionSource !== 'native');
+      const notes = [];
+      if (oldHit.length) notes.push(' Fixed in revamp builds that log <code>motionSensorSource</code>; boltSA <code>SensorRecorderService.ts</code> still needs the same change.');
+      if (nativeHit.length) {
+        notes.push(
+          ` ${nativeHit.map((s) => s.toUpperCase()).join(' and ')} already ${nativeHit.length > 1 ? 'come' : 'comes'} from a build with native motion sensors, so check the native module and batching on that device and platform.`,
+        );
+      }
+      return notes.join('');
+    };
+    const recs = [];
+
+    const unitBug = (r) => r.checks.accTotal.unitBug;
+    let hit = which(unitBug);
+    if (hit) {
+      recs.push(
+        `<strong>Fix the Android acceleration unit bug</strong> (${hit}). TotalAcceleration is ${both((r) => r.checks.accTotal.raw, 0, ' m/s²')} instead of 9.81 because react-native-sensors already returns m/s² on Android and the app multiplies by G again. Apply the G factor on iOS only; linear acceleration is fixed by the same change.${buildNote(unitBug)}`,
+      );
+    }
+    const bursty = (r) => bad('bursts')(r) || bad('monotonic')(r);
+    hit = which(bursty);
+    if (hit) {
+      recs.push(
+        `<strong>Use sensor timestamps, not <code>Date.now()</code></strong> (${hit}). Gyro samples less than 5 ms apart: ${both((r) => r.checks.bursts.raw * 100, 0, '%')}. That is the JS bridge flushing a backlog. Pass the sensor event timestamp from the native side so the timeline is real even when JS stalls.${buildNote(bursty)}`,
+      );
+    }
+    hit = which(bad('gaps'));
+    if (hit) {
+      recs.push(
+        `<strong>Remove the recurring gaps</strong> (${hit}). Longest gap: ${both((r) => (r.stats.Orientation ? r.stats.Orientation.longest : NaN), 1, ' s')}, usually around photo capture. Buffer samples in the native module on a background thread, flush them in batches, and keep image processing off the JS thread during recording.${buildNote(bad('gaps'))}`,
+      );
+    }
+    const slow = (r) => bad('rateNative')(r) || bad('rateRN')(r);
+    hit = which(slow);
+    if (hit) {
+      recs.push(
+        `<strong>Raise the effective sample rate</strong> (${hit}). Native orientation: ${both((r) => (r.stats.Orientation ? r.stats.Orientation.rate : NaN), 1, ' Hz')}; slowest motion sensor: ${both((r) => r.checks.rateRN.raw, 1, ' Hz')}; target ${fmt(a.targetHz, 0)} Hz. Read gyroscope, accelerometer and magnetometer in the native module with a fixed schedule.${buildNote(slow)}`,
+      );
+    }
+    hit = which((r) => !r.loggedHeading.n && bad('compass')(r));
+    if (hit) {
+      recs.push(
+        `<strong>Use the quaternion camera heading for fraud checks</strong> (${hit}). The logged compass is not tilt-compensated and disagrees with the camera by ${both((r) => r.compassAgreement.atCaptures, 0, '°')} at photos. Log the camera heading from <code>qx, qy, qz, qw</code> (revamp now writes <code>cameraHeading</code>) or calculate it as this page does.`,
+      );
+    }
+    hit = which(bad('cameraHeadingLogged'));
+    if (hit) {
+      recs.push(
+        `<strong>Check the app's <code>cameraHeading</code></strong> (${hit}). It differs from this page's quaternion heading (${both((r) => r.checks.cameraHeadingLogged.raw, 1, '°')} at the 95th percentile), so the app's walk-around flag may be wrong. Check the platform frame in <code>smartRecordingWalkaround.ts</code>.`,
+      );
+    }
+    hit = which(bad('walkaroundFlag'));
+    if (hit) {
+      recs.push(
+        `<strong>Investigate the app's walk-around flag</strong> (${hit}). ${SLOTS.filter((s) => bad('walkaroundFlag')(state.res[s])).map((s) => `${s.toUpperCase()}: ${esc(state.res[s].checks.walkaroundFlag.value)}`).join('; ')}. Compare the per-photo "app" headings and the photo labels.`,
+      );
+    }
+    hit = which((r) => !r.app.walkaround);
+    if (hit) {
+      recs.push(
+        `<strong>Add a walk-around check to the app or backend</strong> (not logged in ${hit}). The two strongest signals are cheap to compute from the annotations: camera heading reversals between photos (${both((r) => (r.camProgress ? r.camProgress.reversals : NaN), 0)}) and total camera sweep (${both((r) => (r.camProgress ? r.camProgress.net : NaN), 0, '°')}). Revamp now writes <code>walkaroundStatus</code> to the log metadata for review; boltSA does not.`,
+      );
+    }
+    if (!recs.length) {
+      recs.push('<strong class="txt-ok">Both logs pass the implementation checks.</strong> Keep using these builds for new recordings.');
+    }
+    recs.push(
+      `<strong>Collect more labelled runs before trusting the score.</strong> Record several genuine and fraudulent inspections on different devices, including iOS, then tune the weights and thresholds in <code>src/engine.js</code>. Only then consider warning users live.`,
+    );
     $('recommendationList').innerHTML = recs.map((r) => `<li>${r}</li>`).join('');
   }
 

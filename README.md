@@ -52,6 +52,17 @@ node build.mjs path/to/logA.json path/to/logB.json "Name A" "Name B"
 - **Missing data:** signals that can't be calculated (no GPS, no orientation, fewer than 3 photos) are left out of the score instead of counting as 0. If less than half the signal weight is available, the verdict is "Insufficient data".
 - **Warnings box:** under the verdict cards, the page lists all of the above, plus when the two logs come from different platforms, devices or app versions.
 
+## Logs from fixed revamp builds
+
+Revamp builds with the sensor accuracy fix write extra fields. Older logs (boltSA, or earlier revamp builds) don't have them and still work.
+
+- `metadata.motionSensorSource` (`native` or `react_native_sensors`) and `metadata.headingReference`: shown on each verdict card. A log without `motionSensorSource` gets a note that it is from an older build, which has the acceleration unit bug and the gaps.
+- `cameraHeading` on Orientation rows: compared with the heading this page calculates from the quaternion (**Logged cameraHeading matches the quaternion** check). The per-photo table shows the app's value under the page's value.
+- `metadata.walkaroundStatus`, `walkaroundPhotoCount`, `walkaroundReversals`, `walkaroundSweepDeg`: the app's own walk-around flag. It is shown on the verdict card, and the page re-runs the same rule to check it (**App walk-around flag matches this page**). The rule is simpler than the fraud score: 2+ heading reversals, or under 180° sweep with 6+ photos, is suspicious.
+- Exterior photo annotations: `label` is the angle name shown on the capture screen (for example `Front Passenger Corner`) and `position` is the slot key (for example `front-left`). The page places photos by `position` when it is present, and otherwise reads the slot from the label (`front-left-capture.jpg` in older logs).
+
+The recommendations list only shows problems found in the loaded logs, so a pair of logs from a fixed build shows fewer items.
+
 ## How the fraud score works
 
 The camera heading at each photo is calculated from the orientation quaternion (`qx`, `qy`, `qz`, `qw`). The logged compass is not used, because it is not tilt-compensated. A genuine walk-around keeps turning one way through about 315°, and the camera points at the centre of the walked ring.

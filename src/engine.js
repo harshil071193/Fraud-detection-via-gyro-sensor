@@ -57,6 +57,9 @@
   const REVERSAL_DEG = 15;
   const CAPTURE_GAP_WINDOW_S = 1.5;
 
+  // Same rule as the revamp app's on-device walk-around summary (smartRecordingWalkaround.ts).
+  const APP_RULE = { minPhotos: 3, suspiciousReversals: 2, sweepCheckMinPhotos: 6, minSweepDeg: 180 };
+
   // ---------- math helpers ----------
   const num = (v) => {
     const n = typeof v === 'number' ? v : parseFloat(v);
@@ -168,6 +171,50 @@
     return { platform: 'unknown', source: 'not in metadata' };
   }
 
+  // Fields written by revamp builds with native motion sensors and the on-device walk-around summary.
+  function appFields(meta) {
+    const status = meta.walkaroundStatus ? String(meta.walkaroundStatus) : '';
+    return {
+      motionSource: meta.motionSensorSource ? String(meta.motionSensorSource) : '',
+      headingReference: meta.headingReference ? String(meta.headingReference) : '',
+      walkaround: status
+        ? {
+            status,
+            photos: num(meta.walkaroundPhotoCount),
+            reversals: num(meta.walkaroundReversals),
+            sweep: num(meta.walkaroundSweepDeg),
+          }
+        : null,
+    };
+  }
+
+  // Re-runs the app's walk-around rule on this page's camera headings, in position order
+  // (front -> front-right) rather than time order, so it can be compared with the app's result.
+  function appRule(captures) {
+    const order = new Map(SLOT_ORDER.map((s, i) => [s.key, i]));
+    const headings = captures
+      .filter((c) => order.has(c.key) && finite(c.cam))
+      .sort((x, y) => order.get(x.key) - order.get(y.key))
+      .map((c) => c.cam);
+    if (headings.length < APP_RULE.minPhotos) return { status: 'insufficient_data', photos: headings.length, reversals: NaN, sweep: NaN };
+    const steps = headings.slice(1).map((h, i) => wrap180(h - headings[i]));
+    const net = sum(steps);
+    const dir = net >= 0 ? 1 : -1;
+    const reversals = steps.filter((s) => s * dir < -REVERSAL_DEG).length;
+    const sweep = Math.abs(net);
+    const suspicious =
+      reversals >= APP_RULE.suspiciousReversals || (headings.length >= APP_RULE.sweepCheckMinPhotos && sweep < APP_RULE.minSweepDeg);
+    return { status: suspicious ? 'suspicious' : 'normal', photos: headings.length, reversals, sweep };
+  }
+
+  // How closely the app's logged cameraHeading matches the heading this page derives from the quaternion.
+  function loggedHeadingAgreement(orientation) {
+    const diffs = orientation
+      .filter((r) => finite(r.cameraHeading) && finite(r.cam))
+      .map((r) => Math.abs(wrap180(r.cameraHeading - r.cam)));
+    return { n: diffs.length, p95: quantile(diffs, 0.95), max: diffs.length ? maxOf(diffs) : NaN };
+  }
+
   function toNumRow(e) {
     const row = {};
     Object.keys(e).forEach((k) => {
@@ -244,11 +291,13 @@
       const o = snap.Orientation ? toNumRow(snap.Orientation) : nearest(streams.Orientation, t, 1);
       const c = snap.Compass ? toNumRow(snap.Compass) : nearest(streams.Compass, t, 1);
       const l = snap.Location ? toNumRow(snap.Location) : nearest(streams.Location, t, 5);
-      const slot = slotForLabel(a.label);
+      // Newer app builds send the screen name as label and the slot key as position.
+      const slot = (a.position && SLOT_BY_KEY[String(a.position)]) || slotForLabel(a.label);
       const key = slot ? slot.key : labelKey(a.label);
 
       caps.push({
         label: String(a.label),
+        position: a.position ? String(a.position) : null,
         key,
         short: slot ? slot.short : key,
         name: slot ? slot.name : key,
@@ -257,6 +306,7 @@
         capturedAt: a.captured_at,
         latency: snapTimes.length && finite(t) ? t - maxOf(snapTimes) : NaN,
         cam: cameraHeading(o, frame),
+        appCam: o ? num(o.cameraHeading) : NaN,
         pitch: o ? num(o.pitch) * DEG : NaN,
         roll: o ? num(o.roll) * DEG : NaN,
         yaw: o ? num(o.yaw) * DEG : NaN,
@@ -488,6 +538,11 @@
   // ---------- checks ----------
   const status = (ok, warn) => (ok ? 'pass' : warn ? 'warn' : 'fail');
 
+  function describeWalkaround(w) {
+    if (w.status === 'insufficient_data') return `insufficient data (${w.photos} photos)`;
+    return `${w.status} (${w.reversals} reversals, ${finite(w.sweep) ? w.sweep.toFixed(0) : '?'}° sweep)`;
+  }
+
   function accuracyChecks(a) {
     const { streams, stats, meta, captures, epochMs } = a;
     const checks = {};
@@ -536,9 +591,10 @@
     const rn = RN_SENSORS.map((s) => stats[s]).filter((s) => s && s.n > 1);
     const rnMin = rn.length ? rn.reduce((m, s) => (s.rate < m.rate ? s : m)) : null;
     const rnRatio = rnMin ? rnMin.rate / rnMin.targetHz : NaN;
+    const motionSource = a.app.motionSource === 'native' ? 'native' : 'react-native-sensors';
     checks.rateRN = {
       status: rnMin ? status(rnRatio >= 0.9, rnRatio >= 0.6) : 'na',
-      value: rnMin ? `lowest ${rnMin.name} ${rnMin.rate.toFixed(1)} Hz (${(rnRatio * 100).toFixed(0)}%)` : 'no data',
+      value: rnMin ? `lowest ${rnMin.name} ${rnMin.rate.toFixed(1)} Hz (${(rnRatio * 100).toFixed(0)}%) · ${motionSource}` : 'no data',
       raw: rnMin ? rnMin.rate : NaN,
     };
 
@@ -588,6 +644,27 @@
         ? `${ca.atCaptures.toFixed(0)}° at photos (whole log ${ca.mad.toFixed(0)}°)`
         : 'no data',
       raw: ca.atCaptures,
+    };
+
+    const lh = a.loggedHeading;
+    checks.cameraHeadingLogged = {
+      status: lh.n ? status(lh.p95 < 1, lh.p95 < 5) : 'na',
+      value: lh.n ? `95% within ${lh.p95.toFixed(2)}° of this page (${lh.n.toLocaleString()} samples)` : 'not in log (older build)',
+      raw: lh.p95,
+    };
+
+    const aw = a.app.walkaround;
+    const pr = a.appRule;
+    const sameNumbers =
+      aw &&
+      aw.photos === pr.photos &&
+      (aw.status === 'insufficient_data' || (aw.reversals === pr.reversals && Math.abs(aw.sweep - pr.sweep) <= 5));
+    checks.walkaroundFlag = {
+      status: !aw ? 'na' : aw.status !== pr.status ? 'fail' : sameNumbers ? 'pass' : 'warn',
+      value: !aw
+        ? 'not in log (older build)'
+        : `app ${describeWalkaround(aw)} · page ${describeWalkaround(pr)}`,
+      raw: aw ? aw.status : '',
     };
 
     const lat = captures.map((c) => c.latency).filter(finite);
@@ -924,6 +1001,9 @@
       motion,
       timing,
       compassAgreement: compassAgreement(streams.Orientation || [], streams.Compass || []),
+      app: appFields(meta),
+      appRule: appRule(captures),
+      loggedHeading: loggedHeadingAgreement(streams.Orientation || []),
     };
     const ca = analysis.compassAgreement;
     captures.forEach((c) => {
@@ -955,6 +1035,14 @@
     const src = String(a.meta.orientationSource || '');
     if (src && src !== 'native') add('warn', `Orientation came from "${src}" instead of the native module, so headings are less accurate.`);
     if (!src) add('info', 'Metadata has no orientationSource (older or boltSA build); assuming the native orientation module.');
+    if (!a.app.motionSource) {
+      add(
+        'info',
+        'Metadata has no motionSensorSource, so this log is from boltSA or a revamp build before the sensor accuracy fix. Expect the Android acceleration unit bug, receive-time timestamps and gaps around photos.',
+      );
+    } else if (a.app.motionSource !== 'native') {
+      add('warn', `Motion sensors came from "${a.app.motionSource}" instead of the native module, so rates and timestamps are less reliable.`);
+    }
     if (!(a.streams.Orientation || []).length) add('bad', 'No Orientation data in this log; heading-based fraud checks are not possible.');
     if (a.allCaptures.length < 3) add('bad', `Only ${a.allCaptures.length} photo annotations; walk-around checks need at least 3.`);
     if (!a.labelsRecognised && a.allCaptures.length >= 3) {
@@ -985,6 +1073,7 @@
     SENSORS,
     NATIVE_SENSORS,
     RN_SENSORS,
+    APP_RULE,
     SLOT_ORDER,
     slotForLabel,
     helpers: { mean, median, std, quantile, wrap180, norm360, finite, nearest, between, cameraHeading, maxOf, minOf },
