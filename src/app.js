@@ -336,6 +336,7 @@
     renderCircle(a, b);
     renderMotion(a, b);
     renderCaptures(a, b);
+    renderInterior(a, b);
     renderAccuracy(a, b);
     renderSignals(a, b);
     renderRecommendations(a, b);
@@ -962,6 +963,50 @@
     };
     $('capturesA').innerHTML = table(a, 'a');
     $('capturesB').innerHTML = table(b, 'b');
+  }
+
+  // ---------- interior ----------
+  function renderInterior(a, b) {
+    const table = (res, slot) => {
+      const title = `<h3><span class="col-${slot}">${slot.toUpperCase()}</span> · ${esc(state.names[slot])}</h3>`;
+      const inside = res.interior;
+      if (!inside.captures.length) return `${title}<p class="hint">No interior photos in this log.</p>`;
+      const total = E.INTERIOR_SLOTS.length;
+      const summary = [
+        `<span class="${inside.missing.length ? 'txt-warn' : 'txt-ok'}">${inside.captures.length} of ${total} taken</span>`,
+        `over ${fmtDur(inside.span)}`,
+        finite(inside.afterExterior) ? `started ${fmtDur(inside.afterExterior)} after the last exterior photo` : '',
+        inside.hasCarCentre
+          ? `<span class="${inside.far.length ? 'txt-bad' : 'txt-ok'}">furthest ${fmt(inside.maxCarDistance, 1)} m from the car</span>`
+          : 'car centre unknown (fewer than 3 exterior GPS fixes)',
+        inside.retakes.length ? `${inside.retakes.length} retaken` : '',
+        inside.outOfOrder ? '<span class="txt-warn">not in the app order</span>' : '',
+      ]
+        .filter(Boolean)
+        .join(' · ');
+      const rows = inside.captures
+        .map(
+          (c, i) => `<tr>
+            <td class="num">${i + 1}</td>
+            <td><strong>${esc(c.name)}</strong><div class="small">${[c.label !== c.name ? c.label : '', c.position || ''].filter(Boolean).map(esc).join(' · ')}</div></td>
+            <td class="num">${fmt(c.t, 1)} s</td>
+            <td class="num">${finite(c.interval) ? `${c.interval.toFixed(1)} s` : '–'}</td>
+            <td class="num ${!finite(c.carDistance) ? '' : c.farFromCar ? 'txt-bad' : 'txt-ok'}">${finite(c.carDistance) ? `${c.carDistance.toFixed(1)} m` : '–'}</td>
+            <td class="num">±${fmt(c.gpsAcc, 1)} m</td>
+            <td class="num">${fmt(c.cam, 0, '°')}</td>
+            <td class="num">${fmt(c.pitch, 0, '°')} / ${fmt(c.roll, 0, '°')}</td>
+          </tr>`,
+        )
+        .join('');
+      const missing = inside.missing.length
+        ? `<p class="small txt-warn">Missing: ${inside.missing.map((s) => esc(s.name)).join(', ')}</p>`
+        : '';
+      return `${title}<p class="small">${summary}</p><table><thead><tr>
+        <th class="num">#</th><th>Photo</th><th class="num">Time</th><th class="num">Since previous</th><th class="num">From car</th><th class="num">GPS acc.</th><th class="num">Camera heading</th><th class="num">Pitch / roll</th>
+      </tr></thead><tbody>${rows}</tbody></table>${missing}`;
+    };
+    $('interiorA').innerHTML = table(a, 'a');
+    $('interiorB').innerHTML = table(b, 'b');
   }
 
   // ---------- accuracy ----------

@@ -34,6 +34,22 @@
   ];
   const SLOT_EXTRA = [{ key: 'right-side', short: 'RS', name: 'Right side', slot: 270 }];
   const SLOT_BY_KEY = Object.fromEntries(SLOT_ORDER.concat(SLOT_EXTRA).map((s) => [s.key, s]));
+  // Interior captures in the order the app asks for them: upload key (sent as `position`) and the
+  // name shown on the capture screen (sent as `label`). Older builds label them `<key>-capture.jpg`.
+  const INTERIOR_SLOTS = [
+    { key: 'passenger-front-side', name: 'Passenger Front Seat' },
+    { key: 'passenger-front-door', name: 'Passenger Front Door' },
+    { key: 'interior-cabin', name: 'Passenger Rear Seat' },
+    { key: 'passenger-rear-door', name: 'Passenger Rear Door' },
+    { key: 'dashboard', name: 'Interior Dashboard Left' },
+    { key: 'steering', name: 'Interior Dashboard Right' },
+    { key: 'boot-space', name: 'Boot/Trunk' },
+  ].map((s, order) => ({ ...s, order }));
+  const INTERIOR_BY_KEY = Object.fromEntries(INTERIOR_SLOTS.map((s) => [s.key, s]));
+  const INTERIOR_BY_NAME = Object.fromEntries(INTERIOR_SLOTS.map((s) => [s.name.toLowerCase(), s]));
+  // GPS fixes for photos taken inside or at the car should stay within this distance of the
+  // centre of the exterior photo ring (or twice the GPS accuracy, if larger).
+  const INTERIOR_NEAR_CAR_M = 20;
   const LABEL_STOP_WORDS = new Set([
     'capture',
     'image',
@@ -152,6 +168,16 @@
     if (set.size === 1 && set.has('left')) return SLOT_BY_KEY['left-side'];
     if (set.size === 1 && set.has('right')) return SLOT_BY_KEY['right-side'];
     return null;
+  }
+
+  function interiorSlotFor(annotation) {
+    const byPosition = annotation.position && INTERIOR_BY_KEY[String(annotation.position)];
+    if (byPosition) return byPosition;
+    const label = String(annotation.label || '').trim();
+    const byName = INTERIOR_BY_NAME[label.toLowerCase()];
+    if (byName) return byName;
+    const legacy = /^(.+)-capture\.jpe?g$/i.exec(label);
+    return legacy ? INTERIOR_BY_KEY[legacy[1].toLowerCase()] || null : null;
   }
 
   function labelKey(label) {
@@ -334,16 +360,19 @@
       const c = snap.Compass ? toNumRow(snap.Compass, epochMs) : nearest(streams.Compass, t, 1);
       const l = snap.Location ? toNumRow(snap.Location, epochMs) : nearest(streams.Location, t, 5);
       // Newer app builds send the screen name as label and the slot key as position.
-      const slot = (a.position && SLOT_BY_KEY[String(a.position)]) || slotForLabel(a.label);
-      const key = slot ? slot.key : labelKey(a.label);
+      const interior = interiorSlotFor(a);
+      const slot = interior ? null : (a.position && SLOT_BY_KEY[String(a.position)]) || slotForLabel(a.label);
+      const key = interior ? interior.key : slot ? slot.key : labelKey(a.label);
 
       caps.push({
         label: String(a.label),
         position: a.position ? String(a.position) : null,
         key,
         short: slot ? slot.short : key,
-        name: slot ? slot.name : key,
+        name: interior ? interior.name : slot ? slot.name : key,
         slot: slot ? slot.slot : NaN,
+        interior: interior ? interior.key : null,
+        interiorOrder: interior ? interior.order : NaN,
         t,
         capturedAt: a.captured_at,
         latency: snapTimes.length && finite(t) ? t - maxOf(snapTimes) : NaN,
@@ -748,6 +777,7 @@
     const extra = [];
     if (a.retakes.length) extra.push(`${a.retakes.length} retaken`);
     if (a.ignoredCaptures.length) extra.push(`${a.ignoredCaptures.length} ignored`);
+    if (a.interior.captures.length) extra.push(`${a.interior.captures.length} interior handled separately`);
     checks.captures = {
       status: status(captures.length >= 10 && known === captures.length, captures.length >= 8),
       value: `${captures.length} photos used, ${known} recognised labels${extra.length ? ` (${extra.join(', ')})` : ''}`,
@@ -900,6 +930,44 @@
     return { signals, score, verdict, level, insufficient, availableWeight, totalWeight };
   }
 
+  // Interior photos: which of the seven were taken, when, and how far (by GPS) from the centre of
+  // the exterior photo ring. Review evidence only; it does not change the fraud score.
+  function interiorMetrics(allCaptures, exterior, ring, project) {
+    const pool = allCaptures.filter((c) => c.interior);
+    const lastByKey = new Map();
+    pool.forEach((c) => lastByKey.set(c.key, c));
+    const retakes = pool.filter((c) => lastByKey.get(c.key) !== c);
+    const captures = pool.filter((c) => lastByKey.get(c.key) === c);
+    const lastExterior = exterior.length ? exterior[exterior.length - 1] : null;
+    captures.forEach((c, i) => {
+      const prev = i ? captures[i - 1] : lastExterior;
+      c.interval = prev ? c.t - prev.t : NaN;
+      const p = finite(c.lat) && finite(c.lon) ? project(c.lat, c.lon) : null;
+      c.e = p ? p.e : NaN;
+      c.n = p ? p.n : NaN;
+      c.carDistance = p && ring ? Math.hypot(p.e - ring.centre.e, p.n - ring.centre.n) : NaN;
+      c.nearCarLimit = Math.max(INTERIOR_NEAR_CAR_M, finite(c.gpsAcc) ? 2 * c.gpsAcc : 0);
+      c.farFromCar = finite(c.carDistance) && c.carDistance > c.nearCarLimit;
+    });
+    const taken = new Set(captures.map((c) => c.key));
+    const distances = captures.map((c) => c.carDistance).filter(finite);
+    const first = captures[0];
+    const last = captures[captures.length - 1];
+    return {
+      captures,
+      retakes,
+      missing: captures.length ? INTERIOR_SLOTS.filter((s) => !taken.has(s.key)) : [],
+      outOfOrder: captures.some((c, i) => i && c.interiorOrder < captures[i - 1].interiorOrder),
+      legacyLabels: captures.some((c) => !c.position),
+      span: captures.length ? last.t - first.t : NaN,
+      afterExterior: first && lastExterior ? first.t - lastExterior.t : NaN,
+      maxCarDistance: distances.length ? maxOf(distances) : NaN,
+      medianCarDistance: median(distances),
+      far: captures.filter((c) => c.farFromCar),
+      hasCarCentre: Boolean(ring),
+    };
+  }
+
   // ---------- main ----------
   function analyze(json, opts) {
     const options = opts || {};
@@ -925,13 +993,15 @@
       r.cam = cameraHeading(r, frame);
     });
 
-    // Only exterior photos (labels that map to a slot round the car) are used when at least
-    // three are recognised; with retakes only the last photo of each label is kept.
+    // Interior photos never join the walk-around. Of the rest, only exterior photos (labels that
+    // map to a slot round the car) are used when at least three are recognised; with retakes only
+    // the last photo of each label is kept.
     const allCaptures = parseCaptures(json.annotations, streams, epochMs, frame);
-    const recognised = allCaptures.filter((c) => finite(c.slot));
+    const exteriorCandidates = allCaptures.filter((c) => !c.interior);
+    const recognised = exteriorCandidates.filter((c) => finite(c.slot));
     const labelsRecognised = recognised.length >= 3;
-    const pool = labelsRecognised ? recognised : allCaptures;
-    const ignoredCaptures = labelsRecognised ? allCaptures.filter((c) => !finite(c.slot)) : [];
+    const pool = labelsRecognised ? recognised : exteriorCandidates;
+    const ignoredCaptures = labelsRecognised ? exteriorCandidates.filter((c) => !finite(c.slot)) : [];
     const lastByKey = new Map();
     pool.forEach((c) => lastByKey.set(c.key, c));
     const retakes = pool.filter((c) => lastByKey.get(c.key) !== c);
@@ -963,6 +1033,7 @@
     const fullTrack = locRows.map((r) => ({ t: r.t, ...project(r.latitude, r.longitude) }));
 
     const ring = ringMetrics(captures);
+    const interior = interiorMetrics(allCaptures, captures, ring, project);
     const slots = captures.map((c) => c.slot);
     const camProgress = progression(
       captures.map((c) => c.cam),
@@ -1040,6 +1111,7 @@
       dupes,
       totalRows: sum(Object.values(streams).map((l) => l.length)),
       captures,
+      interior,
       track,
       fullTrack,
       ring,
@@ -1106,16 +1178,35 @@
       );
     }
     if (!(a.streams.Orientation || []).length) add('bad', 'No Orientation data in this log; heading-based fraud checks are not possible.');
-    if (a.allCaptures.length < 3) add('bad', `Only ${a.allCaptures.length} photo annotations; walk-around checks need at least 3.`);
-    if (!a.labelsRecognised && a.allCaptures.length >= 3) {
-      const ex = a.allCaptures.slice(0, 3).map((c) => c.label).join(', ');
+    const exteriorCandidates = a.allCaptures.filter((c) => !c.interior);
+    if (exteriorCandidates.length < 3) add('bad', `Only ${exteriorCandidates.length} exterior photo annotations; walk-around checks need at least 3.`);
+    if (!a.labelsRecognised && exteriorCandidates.length >= 3) {
+      const ex = exteriorCandidates.slice(0, 3).map((c) => c.label).join(', ');
       add('warn', `Photo labels are not recognised as positions around the car (e.g. ${ex}). Photos are used in time order and the slot checks are skipped.`);
     }
     if (a.retakes.length) {
       add('info', `${a.retakes.length} retaken photo(s): ${a.retakes.map((c) => c.label).join(', ')}. Only the last photo of each label is used.`);
     }
     if (a.ignoredCaptures.length) {
-      add('info', `Ignored ${a.ignoredCaptures.length} photo(s) that are not exterior positions: ${a.ignoredCaptures.map((c) => c.label).join(', ')}.`);
+      add('info', `Ignored ${a.ignoredCaptures.length} photo(s) that are neither exterior nor interior positions: ${a.ignoredCaptures.map((c) => c.label).join(', ')}.`);
+    }
+    const inside = a.interior;
+    if (inside.far.length) {
+      add(
+        'warn',
+        `${inside.far.length} interior photo(s) have a GPS fix more than ${INTERIOR_NEAR_CAR_M} m from the car (the centre of the exterior photos): ${inside.far
+          .map((c) => `${c.name} ${c.carDistance.toFixed(0)} m`)
+          .join(', ')}. Check that they show the same car.`,
+      );
+    }
+    if (inside.missing.length) {
+      add('info', `${inside.missing.length} of ${INTERIOR_SLOTS.length} interior photos are missing: ${inside.missing.map((s) => s.name).join(', ')}.`);
+    }
+    if (inside.retakes.length) {
+      add('info', `${inside.retakes.length} retaken interior photo(s): ${inside.retakes.map((c) => c.name).join(', ')}. Only the last photo of each is used.`);
+    }
+    if (inside.legacyLabels) {
+      add('info', 'Interior photos use file-name labels (a build before interior screen names); they were matched by file name.');
     }
     const withGps = a.captures.filter((c) => finite(c.lat)).length;
     if (a.captures.length >= 3 && withGps < 3) add('warn', 'Fewer than 3 photos have a GPS position, so the walk map and ring checks are skipped.');
@@ -1137,7 +1228,10 @@
     RN_SENSORS,
     APP_RULE,
     SLOT_ORDER,
+    INTERIOR_SLOTS,
+    INTERIOR_NEAR_CAR_M,
     slotForLabel,
+    interiorSlotFor,
     helpers: { mean, median, std, quantile, wrap180, norm360, finite, nearest, between, cameraHeading, maxOf, minOf },
   };
 })(typeof window !== 'undefined' ? window : globalThis);

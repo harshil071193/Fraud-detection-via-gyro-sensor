@@ -53,6 +53,7 @@
       <a href="#circle">Circle around car</a>
       <a href="#motion">Motion</a>
       <a href="#captures">Per photo</a>
+      <a href="#interior">Interior</a>
       <a href="#accuracy">Implementation accuracy</a>
       <a href="#signals">Fraud signals</a>
       <a href="#recommendations">Recommendations</a>
@@ -163,6 +164,17 @@
         <h2>Per-photo details</h2>
         <div class="card"><div id="capturesA" class="table-wrap"></div></div>
         <div class="card"><div id="capturesB" class="table-wrap"></div></div>
+      </section>
+
+      <section id="interior">
+        <h2>Interior photos</h2>
+        <p class="lead">
+          The seven interior photos, matched by <code>position</code> (newer builds), the screen name, or the older
+          <code>&lt;position&gt;-capture.jpg</code> label. They are not part of the walk-around or the fraud score. Distance is the
+          photo's GPS fix from the centre of the exterior photos; more than 20 m (or twice the GPS accuracy) is flagged.
+        </p>
+        <div class="card"><div id="interiorA" class="table-wrap"></div></div>
+        <div class="card"><div id="interiorB" class="table-wrap"></div></div>
       </section>
 
       <section id="accuracy">
