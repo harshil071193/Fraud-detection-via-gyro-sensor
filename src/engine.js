@@ -215,17 +215,57 @@
     return { n: diffs.length, p95: quantile(diffs, 0.95), max: diffs.length ? maxOf(diffs) : NaN };
   }
 
-  function toNumRow(e) {
+  // Elapsed seconds from the native `time` (epoch ns). Some revamp builds restarted
+  // seconds_elapsed from 0 mid-session, so it is only the fallback.
+  function elapsedSeconds(e, epochMs) {
+    const ns = num(e.time);
+    return finite(ns) && finite(epochMs) ? (ns / 1e6 - epochMs) / 1000 : num(e.seconds_elapsed);
+  }
+
+  function toNumRow(e, epochMs) {
     const row = {};
     Object.keys(e).forEach((k) => {
       if (k !== 'sensor') row[k] = num(e[k]);
     });
-    row.t = num(e.seconds_elapsed);
+    row.se = num(e.seconds_elapsed);
+    row.t = elapsedSeconds(e, epochMs);
     return row;
   }
 
+  function recordingEpochMs(json) {
+    const epochMs = num((json.metadata || {})['recording epoch time']);
+    if (finite(epochMs)) return epochMs;
+    const first = json.continuous_log.find((r) => r && finite(num(r.time)) && finite(num(r.seconds_elapsed)));
+    return first ? num(first.time) / 1e6 - num(first.seconds_elapsed) * 1000 : NaN;
+  }
+
+  // seconds_elapsed jumping back while `time` moves on means the app restarted its clock.
+  function secondsElapsedResets(streams) {
+    let best = { checked: false, count: 0, first: null };
+    Object.entries(streams).forEach(([name, list]) => {
+      if (name === 'Location') return;
+      const rows = list.filter((r) => finite(r.ns) && finite(r.se));
+      if (rows.length < 2) return;
+      let count = 0;
+      let first = null;
+      // A restart before the first row shows up as seconds_elapsed starting well behind `time`.
+      if (finite(rows[0].t) && rows[0].t - rows[0].se > 1) {
+        count += 1;
+        first = { from: rows[0].t, to: rows[0].se, at: rows[0].t, beforeFirstRow: true };
+      }
+      for (let i = 1; i < rows.length; i++) {
+        if (rows[i].se < rows[i - 1].se - 0.5) {
+          count += 1;
+          if (!first) first = { from: rows[i - 1].se, to: rows[i].se, at: rows[i].t };
+        }
+      }
+      if (!best.checked || count > best.count) best = { checked: true, count, first };
+    });
+    return best;
+  }
+
   // ---------- parsing ----------
-  function parseStreams(rawRows) {
+  function parseStreams(rawRows, epochMs) {
     const streams = {};
     const disorder = {};
     const dupes = {};
@@ -233,7 +273,7 @@
       if (!r || !r.sensor) continue;
       const s = String(r.sensor);
       const list = streams[s] || (streams[s] = []);
-      const row = { t: num(r.seconds_elapsed), ns: num(r.time) };
+      const row = { t: elapsedSeconds(r, epochMs), se: num(r.seconds_elapsed), ns: num(r.time) };
       for (const k of Object.keys(r)) {
         if (k === 'sensor' || k === 'time' || k === 'seconds_elapsed') continue;
         row[k] = num(r[k]);
@@ -277,8 +317,10 @@
           if (v && typeof v === 'object') snap[v.sensor || k] = v;
         });
       }
+      // Location `time` is the GPS fix clock, which can run a second or more off the phone clock.
       const snapTimes = Object.values(snap)
-        .map((e) => num(e.seconds_elapsed))
+        .filter((e) => e.sensor !== 'Location')
+        .map((e) => elapsedSeconds(e, epochMs))
         .filter(finite);
       const capMs = Date.parse(a.captured_at);
       const t =
@@ -288,9 +330,9 @@
             ? maxOf(snapTimes)
             : NaN;
 
-      const o = snap.Orientation ? toNumRow(snap.Orientation) : nearest(streams.Orientation, t, 1);
-      const c = snap.Compass ? toNumRow(snap.Compass) : nearest(streams.Compass, t, 1);
-      const l = snap.Location ? toNumRow(snap.Location) : nearest(streams.Location, t, 5);
+      const o = snap.Orientation ? toNumRow(snap.Orientation, epochMs) : nearest(streams.Orientation, t, 1);
+      const c = snap.Compass ? toNumRow(snap.Compass, epochMs) : nearest(streams.Compass, t, 1);
+      const l = snap.Location ? toNumRow(snap.Location, epochMs) : nearest(streams.Location, t, 5);
       // Newer app builds send the screen name as label and the slot key as position.
       const slot = (a.position && SLOT_BY_KEY[String(a.position)]) || slotForLabel(a.label);
       const key = slot ? slot.key : labelKey(a.label);
@@ -624,9 +666,21 @@
     const tc = [];
     Object.values(streams).forEach((l) =>
       l.forEach((r, i) => {
-        if (i % 10 === 0 && finite(r.ns) && finite(epochMs)) tc.push((r.ns / 1e6 - epochMs) / 1000 - r.t);
+        if (i % 10 === 0 && finite(r.ns) && finite(r.se) && finite(epochMs)) tc.push((r.ns / 1e6 - epochMs) / 1000 - r.se);
       }),
     );
+    const se = secondsElapsedResets(streams);
+    checks.secondsElapsed = {
+      status: se.checked ? status(se.count === 0, true) : 'na',
+      value: !se.checked
+        ? 'no time field'
+        : se.count === 0
+          ? 'no resets'
+          : se.first.beforeFirstRow
+            ? `${se.count} reset${se.count > 1 ? 's' : ''}: first row reads ${se.first.to.toFixed(1)} s at ${se.first.at.toFixed(1)} s into the recording`
+            : `${se.count} reset${se.count > 1 ? 's' : ''}: ${se.first.from.toFixed(1)} s → ${se.first.to.toFixed(1)} s at ${se.first.at.toFixed(1)} s`,
+      raw: se.count,
+    };
     const tcMed = median(tc);
     const tcSpread = quantile(tc, 0.95) - quantile(tc, 0.05);
     checks.timeConsistency = {
@@ -856,13 +910,8 @@
       throw new Error(`${fileName || name}: not a smart recording sensor log (continuous_log is missing)`);
     }
     const meta = json.metadata || {};
-    const { streams, disorder, dupes } = parseStreams(json.continuous_log);
-
-    let epochMs = num(meta['recording epoch time']);
-    if (!finite(epochMs)) {
-      const first = json.continuous_log.find((r) => r && finite(num(r.time)) && finite(num(r.seconds_elapsed)));
-      epochMs = first ? num(first.time) / 1e6 - num(first.seconds_elapsed) * 1000 : NaN;
-    }
+    const epochMs = recordingEpochMs(json);
+    const { streams, disorder, dupes } = parseStreams(json.continuous_log, epochMs);
     const sensorNames = SENSORS.filter((s) => streams[s] && streams[s].length).concat(
       Object.keys(streams).filter((s) => !SENSORS.includes(s) && streams[s].length),
     );
@@ -1042,6 +1091,19 @@
       );
     } else if (a.app.motionSource !== 'native') {
       add('warn', `Motion sensors came from "${a.app.motionSource}" instead of the native module, so rates and timestamps are less reliable.`);
+    }
+    if (a.checks.secondsElapsed.raw > 0) {
+      add(
+        'warn',
+        `seconds_elapsed restarts mid-recording (${a.checks.secondsElapsed.value}). This page builds the timeline from the native time field instead. Fixed in revamp: sensors restarting on app foreground or journey resume now keep the session's recording epoch.`,
+      );
+    }
+    const outOfOrder = sum(Object.values(a.disorder));
+    if (outOfOrder > 0) {
+      add(
+        'warn',
+        `${outOfOrder} sensor rows are out of time order (rows from two moments interleave). This page sorts each sensor by time. Fixed in revamp: overlapping sensor flushes reused the same sequence numbers and now run one at a time.`,
+      );
     }
     if (!(a.streams.Orientation || []).length) add('bad', 'No Orientation data in this log; heading-based fraud checks are not possible.');
     if (a.allCaptures.length < 3) add('bad', `Only ${a.allCaptures.length} photo annotations; walk-around checks need at least 3.`);

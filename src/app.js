@@ -1033,11 +1033,20 @@
         id: 'monotonic',
         title: 'Timestamps in order',
         expected: 'no out-of-order, < 1% duplicates',
-        why: 'Duplicates come from the same burst effect.',
-        fix: 'Same fix as bursty delivery.',
+        why: 'Duplicates come from the same burst effect. Out-of-order rows with native timestamps come from two sensor flushes running at once and interleaving their rows.',
+        fix: 'Same fix as bursty delivery. For out-of-order rows: run sensor flushes one at a time (fixed in revamp).',
         ok: 'Timestamps increase steadily.',
       },
-      { id: 'timeConsistency', title: '<code>time</code> vs <code>seconds_elapsed</code>', expected: 'constant offset, spread < 20 ms', why: 'Both are written from the same timestamp; a constant offset is harmless.', fix: 'None needed.' },
+      {
+        id: 'secondsElapsed',
+        title: '<code>seconds_elapsed</code> never restarts',
+        expected: '0 resets',
+        why: 'The app restarted its <code>seconds_elapsed</code> clock mid-recording (sensors restarted on app foreground or journey resume). This page builds the timeline from <code>time</code>, so the other checks are not affected.',
+        fix: 'Keep the session recording epoch when sensors restart (fixed in revamp).',
+        ok: '<code>seconds_elapsed</code> counts from the recording start for the whole session.',
+        na: 'No native <code>time</code> field to compare against.',
+      },
+      { id: 'timeConsistency', title: '<code>time</code> vs <code>seconds_elapsed</code>', expected: 'constant offset, spread < 20 ms', why: 'Both are written from the same timestamp; a constant offset is harmless. A large spread usually means <code>seconds_elapsed</code> restarted (see the check above).', fix: 'None needed if the restart check passes.' },
       {
         id: 'compass',
         title: 'Compass agrees with camera heading at photos',
@@ -1148,6 +1157,12 @@
     if (hit) {
       recs.push(
         `<strong>Use sensor timestamps, not <code>Date.now()</code></strong> (${hit}). Gyro samples less than 5 ms apart: ${both((r) => r.checks.bursts.raw * 100, 0, '%')}. That is the JS bridge flushing a backlog. Pass the sensor event timestamp from the native side so the timeline is real even when JS stalls.${buildNote(bursty)}`,
+      );
+    }
+    hit = which(bad('secondsElapsed'));
+    if (hit) {
+      recs.push(
+        `<strong>Keep <code>seconds_elapsed</code> on one clock</strong> (${hit}). Restarts: ${both((r) => r.checks.secondsElapsed.raw, 0)}. Sensors restarted on app foreground or journey resume and reset the clock to 0. Fixed in revamp: <code>startSmartRecordingSensors</code> now receives the session's recording epoch. This page already uses <code>time</code> for the timeline.`,
       );
     }
     hit = which(bad('gaps'));
